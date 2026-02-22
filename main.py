@@ -1,459 +1,432 @@
 import os
-import re
-import math
+import json
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
-import httpx
 from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
-# =========================
-# ENV / CONFIG
-# =========================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-PANDASCORE_TOKEN = os.getenv("PANDASCORE_TOKEN", "").strip()
 
-# (선택) 기본 게임
-DEFAULT_GAME = os.getenv("DEFAULT_GAME", "lol").strip().lower()
+# -----------------------------
+# ENV
+# -----------------------------
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
-# PandaScore API
 PANDASCORE_BASE = "https://api.pandascore.co"
-HTTP_TIMEOUT = 20.0
+DEFAULT_PER_PAGE = 10
 
-# 점(.) 커맨드 프리픽스
-CMD_PREFIX = "."
+# ✅ 토큰은 "전역변수로 고정"하지 않고, 매번 getenv()로 읽는다 (Railway 변수 반영 문제 100% 방지)
+def get_pandascore_token() -> str:
+    return os.getenv("PANDASCORE_TOKEN", "").strip()
 
-# 최근 성적 몇 경기 볼지
-RECENT_N = int(os.getenv("RECENT_N", "10"))
 
-# 캐시(팀 검색 결과) - 간단 캐시
-TEAM_CACHE_TTL_SEC = 60 * 10  # 10분
-_team_cache: Dict[Tuple[str, str], Tuple[float, List[Dict[str, Any]]]] = {}  # (game_slug, query) -> (ts, teams)
+# -----------------------------
+# Utilities
+# -----------------------------
+def _fmt_dt(iso_str: str | None) -> str:
+    if not iso_str:
+        return "시간 정보 없음"
+    try:
+        # PandaScore는 보통 ISO8601 (UTC) 제공
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        # 한국시간(+9) 표시는 원하면 바꿔도 됨. 여기선 UTC 유지.
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return iso_str
 
-# =========================
-# GAME SLUG MAP
-# =========================
-GAME_ALIASES = {
-    "lol": "league-of-legends",
-    "league": "league-of-legends",
-    "lck": "league-of-legends",
+def _norm(s: str) -> str:
+    return (s or "").strip().lower()
 
-    "valo": "valorant",
-    "valorant": "valorant",
+def _safe_int(x, default=0):
+    try:
+        return int(x)
+    except Exception:
+        return default
 
-    "cs": "cs-go",
-    "csgo": "cs-go",
-    "cs2": "cs-go",
 
-    "dota": "dota-2",
-    "dota2": "dota-2",
+# -----------------------------
+# PandaScore HTTP (no extra deps)
+# -----------------------------
+async def ps_get(path: str, params: dict | None = None) -> list | dict:
+    token = get_pandascore_token()
+    if not token:
+        raise RuntimeError("NO_TOKEN")
 
-    "ow": "overwatch",
-    "overwatch": "overwatch",
+    qs = ""
+    if params:
+        qs = "?" + urlencode(params, doseq=True)
 
-    "r6": "r6-siege",
-    "r6s": "r6-siege",
+    url = f"{PANDASCORE_BASE}{path}{qs}"
 
-    "pubg": "pubg",
-    "apex": "apex-legends",
-}
+    def _do_request():
+        req = Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+                "User-Agent": "telegram-bot/1.0",
+            },
+            method="GET",
+        )
+        with urlopen(req, timeout=15) as resp:
+            data = resp.read().decode("utf-8", errors="ignore")
+            return json.loads(data)
 
-def now_ts() -> int:
-    return int(datetime.now(tz=timezone.utc).timestamp())
+    try:
+        return await asyncio.to_thread(_do_request)
+    except HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+        raise RuntimeError(f"HTTP_{e.code}:{body[:400]}")
+    except URLError as e:
+        raise RuntimeError(f"URL_ERROR:{e}")
+    except Exception as e:
+        raise RuntimeError(f"REQ_ERROR:{e}")
 
-def clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
 
-def sigmoid(z: float) -> float:
-    return 1.0 / (1.0 + math.exp(-z))
-
-def norm_name(s: str) -> str:
-    return re.sub(r"\s+", " ", s).strip().lower()
-
-def game_to_slug(game: str) -> str:
-    g = (game or "").strip().lower()
-    return GAME_ALIASES.get(g, g)
-
-# =========================
-# PandaScore Client
-# =========================
-class PandaScoreError(Exception):
-    pass
-
+# -----------------------------
+# Domain models
+# -----------------------------
 @dataclass
 class Team:
     id: int
     name: str
-    acronym: Optional[str] = None
+    acronym: str | None = None
 
-class PandaScoreClient:
-    def __init__(self, token: str):
-        self.token = token
-        self._client: Optional[httpx.AsyncClient] = None
+@dataclass
+class MatchInfo:
+    id: int
+    begin_at: str | None
+    league: str | None
+    serie: str | None
+    opponents: list  # [{"id":..,"name":..}, ...]
+    winner_id: int | None
+    status: str | None
+    name: str | None
 
-    async def __aenter__(self):
-        headers = {"Authorization": f"Bearer {self.token}"}
-        self._client = httpx.AsyncClient(base_url=PANDASCORE_BASE, headers=headers, timeout=HTTP_TIMEOUT)
-        return self
 
-    async def __aexit__(self, exc_type, exc, tb):
-        if self._client:
-            await self._client.aclose()
+# -----------------------------
+# PandaScore helpers (LoL 중심)
+# -----------------------------
+async def find_lol_team(query: str) -> Team | None:
+    q = query.strip()
+    if not q:
+        return None
 
-    async def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-        if not self._client:
-            raise PandaScoreError("HTTP client not initialized")
-        r = await self._client.get(path, params=params or {})
-        if r.status_code == 401:
-            raise PandaScoreError("PandaScore 토큰이 유효하지 않거나 권한이 없어.")
-        if r.status_code >= 400:
-            raise PandaScoreError(f"PandaScore API 오류: {r.status_code} - {r.text[:200]}")
-        return r.json()
+    # 1) search[name]
+    data = await ps_get(
+        "/lol/teams",
+        params={
+            "search[name]": q,
+            "per_page": 10,
+        },
+    )
+    if isinstance(data, list) and data:
+        t = data[0]
+        return Team(id=_safe_int(t.get("id")), name=t.get("name") or q, acronym=t.get("acronym"))
 
-    async def search_teams(self, game_slug: str, query: str, per_page: int = 10) -> List[Team]:
-        # 캐시
-        key = (game_slug, norm_name(query))
-        tnow = now_ts()
-        cached = _team_cache.get(key)
-        if cached and (tnow - cached[0] < TEAM_CACHE_TTL_SEC):
-            return [Team(id=x["id"], name=x["name"], acronym=x.get("acronym")) for x in cached[1]]
+    # 2) search[acronym] fallback
+    data2 = await ps_get(
+        "/lol/teams",
+        params={
+            "search[acronym]": q,
+            "per_page": 10,
+        },
+    )
+    if isinstance(data2, list) and data2:
+        t = data2[0]
+        return Team(id=_safe_int(t.get("id")), name=t.get("name") or q, acronym=t.get("acronym"))
 
-        # PandaScore는 팀 검색에 search[name]을 지원하는 경우가 많음
-        # videogame은 filter[videogame] 또는 filter[videogame_id]가 케이스마다 다를 수 있어, 여기선 slug 기반으로 matches 쪽에서 주로 제한하고,
-        # 팀은 name 검색 후 결과에서 유사도 기준으로 고름.
-        data = await self.get("/teams", params={
-            "search[name]": query,
-            "per_page": per_page
-        })
+    return None
 
-        teams_raw = []
-        for it in data or []:
-            if "id" in it and "name" in it:
-                teams_raw.append({"id": it["id"], "name": it["name"], "acronym": it.get("acronym")})
+def _parse_match(m: dict) -> MatchInfo:
+    opponents = []
+    for o in (m.get("opponents") or []):
+        opp = o.get("opponent") or {}
+        if opp.get("id") is not None:
+            opponents.append({"id": _safe_int(opp.get("id")), "name": opp.get("name") or "Unknown"})
+    league = (m.get("league") or {}).get("name")
+    serie = (m.get("serie") or {}).get("full_name") or (m.get("serie") or {}).get("name")
+    return MatchInfo(
+        id=_safe_int(m.get("id")),
+        begin_at=m.get("begin_at"),
+        league=league,
+        serie=serie,
+        opponents=opponents,
+        winner_id=_safe_int(m.get("winner_id"), None) if m.get("winner_id") is not None else None,
+        status=m.get("status"),
+        name=m.get("name"),
+    )
 
-        _team_cache[key] = (tnow, teams_raw)
-        return [Team(id=x["id"], name=x["name"], acronym=x.get("acronym")) for x in teams_raw]
+async def get_upcoming_matches_for_team(team: Team, limit: int = 5) -> list[MatchInfo]:
+    # PandaScore 필터가 환경/버전에 따라 다를 수 있어서
+    # 1) filter[opponent_id] 시도 -> 2) search[opponents.name] fallback
+    params_try = [
+        ("/lol/matches/upcoming", {"filter[opponent_id]": team.id, "per_page": limit}),
+        ("/lol/matches/upcoming", {"search[opponents.name]": team.name, "per_page": limit}),
+    ]
 
-    async def recent_matches_for_team(self, team_id: int, per_page: int = 20) -> List[Dict[str, Any]]:
-        # 팀이 등장한 최근 경기들
-        # opponent_id 필터는 PandaScore에서 흔히 지원됨
-        return await self.get("/matches", params={
-            "filter[opponent_id]": team_id,
-            "sort": "-begin_at",
-            "per_page": per_page
-        })
+    for path, params in params_try:
+        try:
+            data = await ps_get(path, params=params)
+            if isinstance(data, list) and data:
+                return [_parse_match(x) for x in data[:limit]]
+        except Exception:
+            continue
 
-    async def upcoming_matches(self, game_slug: str, per_page: int = 10) -> List[Dict[str, Any]]:
-        # 다가오는 경기
-        return await self.get("/matches/upcoming", params={
-            "filter[videogame]": game_slug,
-            "sort": "begin_at",
-            "per_page": per_page
-        })
+    return []
 
-# =========================
-# Analysis / Recommendation
-# =========================
-def match_finished(m: Dict[str, Any]) -> bool:
-    # PandaScore match status 예: finished, running, not_started 등
-    st = (m.get("status") or "").lower()
-    return st == "finished"
+async def get_recent_matches_for_team(team: Team, limit: int = 10) -> list[MatchInfo]:
+    params_try = [
+        ("/lol/matches/past", {"filter[opponent_id]": team.id, "per_page": limit}),
+        ("/lol/matches/past", {"search[opponents.name]": team.name, "per_page": limit}),
+    ]
 
-def extract_opponent_team_ids(m: Dict[str, Any]) -> List[int]:
-    opps = m.get("opponents") or []
-    ids = []
-    for o in opps:
-        team = (o or {}).get("opponent") or {}
-        tid = team.get("id")
-        if isinstance(tid, int):
-            ids.append(tid)
-    return ids
+    for path, params in params_try:
+        try:
+            data = await ps_get(path, params=params)
+            if isinstance(data, list) and data:
+                return [_parse_match(x) for x in data[:limit]]
+        except Exception:
+            continue
 
-def winner_team_id(m: Dict[str, Any]) -> Optional[int]:
-    wid = m.get("winner_id")
-    return wid if isinstance(wid, int) else None
+    return []
 
-def compute_recent_form(team_id: int, matches: List[Dict[str, Any]], n: int) -> Tuple[int, int, float]:
-    """return (wins, games_counted, winrate)"""
+def calc_winrate(team: Team, matches: list[MatchInfo]) -> tuple[int, int, float]:
+    # (wins, total, rate)
+    total = 0
     wins = 0
-    played = 0
     for m in matches:
-        if not match_finished(m):
+        # 결과 없는 경기(취소 등) 제외
+        if not m.winner_id:
             continue
-        opp_ids = extract_opponent_team_ids(m)
-        if team_id not in opp_ids:
+        # 팀이 포함된 경기만 카운트(서치 fallback 때문에 가끔 섞일 수 있음)
+        ids = [o["id"] for o in m.opponents]
+        if team.id not in ids:
             continue
-        wid = winner_team_id(m)
-        if wid is None:
-            continue
-        played += 1
-        if wid == team_id:
+        total += 1
+        if m.winner_id == team.id:
             wins += 1
-        if played >= n:
-            break
-    winrate = (wins / played) if played > 0 else 0.0
-    return wins, played, winrate
+    rate = (wins / total) if total else 0.0
+    return wins, total, rate
 
-def head_to_head(team_a: int, team_b: int, matches_a: List[Dict[str, Any]], limit: int = 20) -> Tuple[int, int, int]:
-    """
-    team_a 관점의 H2H: (a_wins, b_wins, played)
-    team_a 최근 경기들 중 team_b와 붙은 경기만 뽑아 계산
-    """
-    a_w = 0
-    b_w = 0
-    played = 0
-    checked = 0
-    for m in matches_a:
-        if checked >= limit:
-            break
-        checked += 1
-        if not match_finished(m):
-            continue
-        opp_ids = extract_opponent_team_ids(m)
-        if not (team_a in opp_ids and team_b in opp_ids):
-            continue
-        wid = winner_team_id(m)
-        if wid is None:
-            continue
-        played += 1
-        if wid == team_a:
-            a_w += 1
-        elif wid == team_b:
-            b_w += 1
-    return a_w, b_w, played
+def predict_winner(team_a: Team, team_b: Team, recent_a: list[MatchInfo], recent_b: list[MatchInfo]) -> tuple[str, str]:
+    # 아주 단순 예측: 최근 N경기 승률 비교
+    wa, ta, ra = calc_winrate(team_a, recent_a)
+    wb, tb, rb = calc_winrate(team_b, recent_b)
 
-def recommend(team1_name: str, team2_name: str, t1: Team, t2: Team,
-              t1_form: Tuple[int, int, float],
-              t2_form: Tuple[int, int, float],
-              h2h: Tuple[int, int, int]) -> Tuple[str, float, List[str]]:
-    """
-    간단 휴리스틱:
-    - 최근 승률 차이 + H2H 약간 가중
-    - 표본이 적으면 확률을 보수적으로(0.55 근처로) 당김
-    """
-    (w1, p1, r1) = t1_form
-    (w2, p2, r2) = t2_form
-    (h1, h2, hp) = h2h
+    # confidence 메시지
+    diff = ra - rb
+    if ta == 0 or tb == 0:
+        return team_a.name, "데이터가 부족해서 기본값(요청 팀 기준)으로만 추천했어."
 
-    # base score: winrate diff
-    score = (r1 - r2) * 2.0  # [-2,2] 정도
-    reasons = []
-
-    reasons.append(f"최근 {RECENT_N}경기 기준: {t1.name} {w1}/{p1} ({r1:.0%}), {t2.name} {w2}/{p2} ({r2:.0%})")
-
-    # H2H
-    if hp >= 3:
-        h_score = ((h1 - h2) / hp) * 0.8
-        score += h_score
-        reasons.append(f"상대전(H2H) {hp}경기: {t1.name} {h1}승 {t2.name} {h2}승")
-    elif hp > 0:
-        h_score = ((h1 - h2) / hp) * 0.4
-        score += h_score
-        reasons.append(f"상대전(H2H) 표본 적음({hp}경기): {t1.name} {h1}승 {t2.name} {h2}승")
-
-    # 표본 보정: 경기수 적으면 score를 줄여서 확률이 과하게 치우치지 않게
-    sample = p1 + p2
-    shrink = clamp(sample / (RECENT_N * 2), 0.35, 1.0)  # 최소 0.35까지 축소
-    score *= shrink
-
-    # 확률로 변환
-    p = sigmoid(score)  # team1이 이길 확률
-    # 확률 너무 과대 방지
-    p = 0.5 + (p - 0.5) * 0.85
-
-    if p >= 0.5:
-        pick = t1.name
-        prob = p
-        reasons.append(f"추천: {t1.name} (추정 승률 {prob:.0%})")
+    if abs(diff) >= 0.30:
+        conf = "꽤 강함"
+    elif abs(diff) >= 0.15:
+        conf = "중간"
     else:
-        pick = t2.name
-        prob = 1.0 - p
-        reasons.append(f"추천: {t2.name} (추정 승률 {prob:.0%})")
+        conf = "약함(박빙)"
 
-    # 주의 문구(고정)
-    reasons.append("※ 이 추천은 공개 경기 데이터 기반의 간단 휴리스틱이야. 확정/보장 아님.")
-    return pick, prob, reasons
+    winner = team_a if diff >= 0 else team_b
+    reason = (
+        f"최근전적 기준 승률: {team_a.name} {wa}/{ta} ({ra:.0%}) vs {team_b.name} {wb}/{tb} ({rb:.0%})\n"
+        f"추천 강도: {conf}"
+    )
+    return winner.name, reason
 
-# =========================
-# Bot Commands (.)
-# =========================
+
+# -----------------------------
+# Telegram: dot command router
+# -----------------------------
 HELP_TEXT = (
-    "🤖 Fakerbot (e스포츠 분석 봇)\n\n"
-    "명령어는 전부 점(.)으로 시작해.\n\n"
-    "• .help\n"
-    "• .ping\n"
-    "• .match <game> <team1> <team2>\n"
-    "   예) .match lol T1 gen\n"
-    "• .upcoming <game>  (가까운 경기 10개)\n"
-    "   예) .upcoming lol\n\n"
-    "지원 game 예: lol, valo, cs2, dota2 ...\n"
+    "🤖 Fakerbot (e스포츠/스포츠 분석)\n\n"
+    "✅ 명령어(점(.)으로 시작)\n"
+    "• .help : 도움말\n"
+    "• .ping : 살아있나 확인\n"
+    "• .team lol <팀명> : 팀 검색(LoL)\n"
+    "• .upcoming lol <팀명> : 다가오는 경기\n"
+    "• .match lol <팀A> <팀B> : 두 팀 비교 + 추천 승리팀(예측)\n\n"
+    "예시)\n"
+    "• .team lol T1\n"
+    "• .upcoming lol T1\n"
+    "• .match lol T1 gen\n"
 )
 
-async def send(update: Update, text: str):
-    if update.message:
-        await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-
-def parse_cmd(text: str) -> Tuple[str, List[str]]:
-    t = text.strip()
-    if not t.startswith(CMD_PREFIX):
-        return "", []
-    t = t[len(CMD_PREFIX):].strip()
-    if not t:
-        return "", []
-    parts = t.split()
-    cmd = parts[0].lower()
-    args = parts[1:]
-    return cmd, args
-
-async def cmd_ping(update: Update):
-    await send(update, "pong ✅")
-
-async def cmd_help(update: Update):
-    await send(update, HELP_TEXT)
-
-def pick_best_team(cands: List[Team], query: str) -> Optional[Team]:
-    if not cands:
-        return None
-    q = norm_name(query)
-    # exact / acronym / contains 우선
-    exact = [t for t in cands if norm_name(t.name) == q]
-    if exact:
-        return exact[0]
-    ac = [t for t in cands if (t.acronym or "").strip().lower() == q]
-    if ac:
-        return ac[0]
-    contains = [t for t in cands if q in norm_name(t.name)]
-    if contains:
-        return contains[0]
-    return cands[0]
-
-async def cmd_match(update: Update, args: List[str]):
-    if not PANDASCORE_TOKEN:
-        await send(update, "❌ PandaScore 토큰이 없어. Railway Variables에 <b>PANDASCORE_TOKEN</b> 추가해줘.")
-        return
-
-    if len(args) < 3:
-        await send(update, "사용법: <b>.match &lt;game&gt; &lt;team1&gt; &lt;team2&gt;</b>\n예) <b>.match lol T1 gen</b>")
-        return
-
-    game = args[0]
-    team1_q = args[1]
-    team2_q = args[2]
-    game_slug = game_to_slug(game)
-
-    async with PandaScoreClient(PANDASCORE_TOKEN) as api:
-        # 팀 검색
-        t1_list = await api.search_teams(game_slug, team1_q, per_page=10)
-        t2_list = await api.search_teams(game_slug, team2_q, per_page=10)
-
-        t1 = pick_best_team(t1_list, team1_q)
-        t2 = pick_best_team(t2_list, team2_q)
-
-        if not t1 or not t2:
-            await send(update, "팀을 찾지 못했어. 철자/약칭 확인해서 다시 쳐봐.\n예) <b>.match lol T1 GEN</b>")
-            return
-        if t1.id == t2.id:
-            await send(update, "같은 팀 두 개는 비교 못해 😅")
-            return
-
-        # 최근 경기
-        m1 = await api.recent_matches_for_team(t1.id, per_page=30)
-        m2 = await api.recent_matches_for_team(t2.id, per_page=30)
-
-        t1_form = compute_recent_form(t1.id, m1, RECENT_N)
-        t2_form = compute_recent_form(t2.id, m2, RECENT_N)
-
-        # H2H는 t1의 최근 경기에서 t2가 같이 나온 것만 대략 계산
-        h2h = head_to_head(t1.id, t2.id, m1, limit=40)
-
-        pick, prob, reasons = recommend(team1_q, team2_q, t1, t2, t1_form, t2_form, h2h)
-
-        # 출력
-        lines = []
-        lines.append(f"📌 <b>{game_slug}</b> 매치업 분석")
-        lines.append(f"• 팀1: <b>{t1.name}</b> (id:{t1.id})")
-        lines.append(f"• 팀2: <b>{t2.name}</b> (id:{t2.id})")
-        lines.append("")
-        lines.extend([f"• {r}" for r in reasons])
-        lines.append("")
-        lines.append(f"🏆 <b>추천 승리팀:</b> <b>{pick}</b>  (추정 {prob:.0%})")
-
-        await send(update, "\n".join(lines))
-
-async def cmd_upcoming(update: Update, args: List[str]):
-    if not PANDASCORE_TOKEN:
-        await send(update, "❌ PandaScore 토큰이 없어. Railway Variables에 <b>PANDASCORE_TOKEN</b> 추가해줘.")
-        return
-
-    game = args[0] if args else DEFAULT_GAME
-    game_slug = game_to_slug(game)
-
-    async with PandaScoreClient(PANDASCORE_TOKEN) as api:
-        matches = await api.upcoming_matches(game_slug, per_page=10)
-
-    if not matches:
-        await send(update, f"다가오는 경기 정보를 못 찾았어. game 확인해줘: <b>{game_slug}</b>")
-        return
-
-    lines = [f"🗓️ <b>{game_slug}</b> Upcoming (최대 10개)"]
-    for m in matches:
-        begin_at = m.get("begin_at") or ""
-        name = m.get("name") or ""
-        league = ((m.get("league") or {}).get("name")) or ""
-        serie = ((m.get("serie") or {}).get("full_name")) or ""
-        lines.append(f"• {begin_at} | {league} {serie} | {name}")
-
-    await send(update, "\n".join(lines))
-
-# =========================
-# Router
-# =========================
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
     text = update.message.text.strip()
-    cmd, args = parse_cmd(text)
-    if not cmd:
-        return  # 점 커맨드 아니면 무시
+    if not text.startswith("."):
+        return
+
+    parts = text[1:].split()
+    if not parts:
+        return
+
+    cmd = _norm(parts[0])
+    args = parts[1:]
 
     if cmd in ("help", "h"):
-        await cmd_help(update)
+        await update.message.reply_text(HELP_TEXT)
         return
+
     if cmd == "ping":
-        await cmd_ping(update)
-        return
-    if cmd in ("match", "m"):
-        await cmd_match(update, args)
-        return
-    if cmd in ("upcoming", "u"):
-        await cmd_upcoming(update, args)
+        token_ok = "OK" if get_pandascore_token() else "NO_PANDASCORE_TOKEN"
+        await update.message.reply_text(f"pong ✅ (PANDASCORE_TOKEN={token_ok})")
         return
 
-    await send(update, f"알 수 없는 명령어야. <b>.help</b> 를 쳐봐")
+    # 토큰 필요한 커맨드들
+    if cmd in ("team", "upcoming", "match"):
+        if not get_pandascore_token():
+            await update.message.reply_text(
+                "❌ PandaScore 토큰이 없어.\n"
+                "Railway Variables에 `PANDASCORE_TOKEN` 추가하고, 컨테이너 재시작(또는 Redeploy) 해줘.\n"
+                "그리고 `.ping`로 토큰 OK 뜨는지 확인!"
+            )
+            return
 
-# =========================
-# MAIN
-# =========================
+    try:
+        if cmd == "team":
+            # .team lol T1
+            if len(args) < 2:
+                await update.message.reply_text("사용법: .team lol <팀명>\n예: .team lol T1")
+                return
+            game = _norm(args[0])
+            q = " ".join(args[1:])
+            if game != "lol":
+                await update.message.reply_text("지금은 lol만 지원해. 예: .team lol T1")
+                return
+
+            team = await find_lol_team(q)
+            if not team:
+                await update.message.reply_text(f"팀을 못 찾았어: {q}")
+                return
+
+            await update.message.reply_text(
+                f"✅ 팀 찾음\n"
+                f"- 이름: {team.name}\n"
+                f"- 약자: {team.acronym or '없음'}\n"
+                f"- ID: {team.id}"
+            )
+            return
+
+        if cmd == "upcoming":
+            # .upcoming lol T1
+            if len(args) < 2:
+                await update.message.reply_text("사용법: .upcoming lol <팀명>\n예: .upcoming lol T1")
+                return
+            game = _norm(args[0])
+            q = " ".join(args[1:])
+            if game != "lol":
+                await update.message.reply_text("지금은 lol만 지원해. 예: .upcoming lol T1")
+                return
+
+            team = await find_lol_team(q)
+            if not team:
+                await update.message.reply_text(f"팀을 못 찾았어: {q}")
+                return
+
+            upcoming = await get_upcoming_matches_for_team(team, limit=5)
+            if not upcoming:
+                await update.message.reply_text(f"다가오는 경기 정보를 못 가져왔어. (팀: {team.name})")
+                return
+
+            lines = [f"📅 {team.name} 다가오는 경기(최대 5개)"]
+            for m in upcoming:
+                opp_names = [o["name"] for o in m.opponents]
+                lines.append(
+                    f"\n• {_fmt_dt(m.begin_at)}\n"
+                    f"  - {m.league or '리그?'} / {m.serie or '시리즈?'}\n"
+                    f"  - 매치: {' vs '.join(opp_names) if opp_names else (m.name or 'Unknown')}"
+                )
+            await update.message.reply_text("\n".join(lines))
+            return
+
+        if cmd == "match":
+            # .match lol T1 gen
+            if len(args) < 3:
+                await update.message.reply_text("사용법: .match lol <팀A> <팀B>\n예: .match lol T1 gen")
+                return
+            game = _norm(args[0])
+            if game != "lol":
+                await update.message.reply_text("지금은 lol만 지원해. 예: .match lol T1 gen")
+                return
+
+            team_a_q = args[1]
+            team_b_q = args[2]
+
+            team_a = await find_lol_team(team_a_q)
+            team_b = await find_lol_team(team_b_q)
+
+            if not team_a or not team_b:
+                await update.message.reply_text(
+                    f"팀을 못 찾았어.\n"
+                    f"- 팀A: {team_a_q} ({'OK' if team_a else 'NOT FOUND'})\n"
+                    f"- 팀B: {team_b_q} ({'OK' if team_b else 'NOT FOUND'})"
+                )
+                return
+
+            # 최근 전적 기반 예측
+            recent_a = await get_recent_matches_for_team(team_a, limit=10)
+            recent_b = await get_recent_matches_for_team(team_b, limit=10)
+
+            winner, reason = predict_winner(team_a, team_b, recent_a, recent_b)
+
+            wa, ta, ra = calc_winrate(team_a, recent_a)
+            wb, tb, rb = calc_winrate(team_b, recent_b)
+
+            msg = (
+                f"🏟️ 매치업 분석 (LoL)\n"
+                f"{team_a.name} vs {team_b.name}\n\n"
+                f"📈 최근전적(최대 10경기 기준)\n"
+                f"- {team_a.name}: {wa}/{ta} ({ra:.0%})\n"
+                f"- {team_b.name}: {wb}/{tb} ({rb:.0%})\n\n"
+                f"⭐ 추천 승리팀(예측): **{winner}**\n"
+                f"{reason}\n\n"
+                f"※ 참고: 이건 단순 통계 기반 예측이라 확정 아님."
+            )
+            await update.message.reply_text(msg, parse_mode="Markdown")
+            return
+
+        # Unknown command
+        await update.message.reply_text("알 수 없는 명령어야. `.help` 쳐봐")
+        return
+
+    except RuntimeError as e:
+        s = str(e)
+        if s == "NO_TOKEN":
+            await update.message.reply_text(
+                "❌ PandaScore 토큰이 없어.\n"
+                "Railway Variables에 `PANDASCORE_TOKEN` 추가하고 재시작(또는 Redeploy) 해줘.\n"
+                "그리고 `.ping`로 토큰 OK 확인!"
+            )
+            return
+
+        # API 에러 상세 출력 (너가 디버깅하기 쉽게)
+        await update.message.reply_text(f"⚠️ API 오류: {s[:800]}")
+        return
+
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ 오류: {type(e).__name__}: {str(e)[:800]}")
+        return
+
+
 def main():
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN 환경변수가 필요해.")
+    if not TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN 환경변수가 없어!")
 
-    # PandaScore 토큰이 없어도 봇은 켜지게(도움말은 출력 가능)
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    app.run_polling()
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-
-    app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
     main()
